@@ -2,7 +2,7 @@ app_name = "shopify_customizations"
 app_title = "Shopify Customizations"
 app_publisher = "Your Company"
 app_description = "Custom overrides for Shopify integration"
-app_version = "0.0.1
+app_version = "0.0.1"
 app_email = "shivarama@cozycornerpatios.com"
 app_license = "mit"
 
