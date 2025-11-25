@@ -245,3 +245,7 @@ app_license = "mit"
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
 
+# Load Shopify overrides on app startup
+after_migrate = "shopify_customizations.overrides"
+
+
