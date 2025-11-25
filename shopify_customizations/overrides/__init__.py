@@ -1,46 +1,44 @@
 import frappe
 import re
-from ecommerce_integrations.shopify.product import ShopifyProduct
 from ecommerce_integrations.shopify import product as shopify_product_module
 
-# ============ OVERRIDE sync_product METHOD ============
-original_sync_product = ShopifyProduct.sync_product
-
-def custom_sync_product(self):
-    """Override to handle null product_id (tips, custom items, deleted products)"""
-    if not self.product_id or str(self.product_id).lower() == 'null':
-        frappe.log_error(
-            title="Shopify Sync - Null Product ID Skipped",
-            message=f"""
-                Skipped syncing product with null product_id.
-                This is expected for tips, custom items, or deleted products.
-                Variant ID: {self.variant_id}
-            """
-        )
-        return None
-    
-    # Call original method for valid product_ids
-    return original_sync_product(self)
-
-# Apply override
-ShopifyProduct.sync_product = custom_sync_product
-
-
-# ============ OVERRIDE create_items_if_not_exist FUNCTION ============
+# Store the original function
 original_create_items = shopify_product_module.create_items_if_not_exist
 
 def custom_create_items_if_not_exist(order):
-    """Handle line items with null product_id separately"""
-    for item in order.line_items:
-        # Handle null product_id (tips, custom items, etc.)
-        if not item.product_id:
-            handle_misc_line_item(item, order)
-            continue
+    """
+    Only handle items with null product_id.
+    All other items go through original Shopify connector flow.
+    """
+    line_items = order.get("line_items", [])
+    
+    # Separate items into two groups
+    items_with_product_id = []
+    items_without_product_id = []
+    
+    for item in line_items:
+        product_id = item.get("product_id")
         
-        # Normal flow for valid products
-        product = ShopifyProduct(item.product_id, item.variant_id)
-        if not frappe.db.exists("Item", {"shopify_product_id": item.product_id}):
-            product.sync_product()
+        if not product_id:
+            # Null product_id - handle separately
+            items_without_product_id.append(item)
+        else:
+            # Valid product_id - keep for original flow
+            items_with_product_id.append(item)
+    
+    # Handle null product_id items (tips, custom items, etc.)
+    for item in items_without_product_id:
+        handle_misc_line_item(item, order)
+    
+    # Call ORIGINAL function for items with valid product_id
+    # This ensures zero impact on normal flow
+    if items_with_product_id:
+        # Create temporary order dict with only valid items
+        order_copy = dict(order)
+        order_copy["line_items"] = items_with_product_id
+        
+        # Call original function - 100% unchanged behavior
+        original_create_items(order_copy)
 
 # Apply override
 shopify_product_module.create_items_if_not_exist = custom_create_items_if_not_exist
@@ -49,23 +47,42 @@ shopify_product_module.create_items_if_not_exist = custom_create_items_if_not_ex
 # ============ HELPER FUNCTIONS ============
 def handle_misc_line_item(line_item, order):
     """Create/retrieve Item for tips and custom additions without product_id"""
-    item_name = line_item.name or "Custom Item"
-    is_tip = "tip" in item_name.lower()
+    item_name = line_item.get("name") or line_item.get("title") or "Custom Item"
+    title_lower = item_name.lower()
+    is_tip = "tip" in title_lower
+    sku = line_item.get("sku", "")
     
-    # Create sanitized item code
-    sanitized = re.sub(r'[^A-Za-z0-9\s-]', '', item_name)
-    item_code = f"SHOPIFY-{'TIP' if is_tip else 'MISC'}-{sanitized.replace(' ', '-')[:40].upper()}"
+    # Determine item code
+    if sku and sku.strip():
+        # Use SKU if available
+        item_code = sku.strip()
+    elif is_tip:
+        # Simple code for tips
+        item_code = "TIP"
+    else:
+        # Create sanitized item code for other custom items
+        sanitized = re.sub(r'[^A-Za-z0-9\s-]', '', item_name)
+        item_code = f"SHOPIFY-MISC-{sanitized.replace(' ', '-')[:40].upper()}"
     
-    # Ensure unique item code
+    # Check if item already exists
     if frappe.db.exists("Item", item_code):
+        frappe.log_error(
+            title="Shopify Null Product ID - Item Already Exists",
+            message=f"Item {item_code} already exists. Skipping creation."
+        )
         return item_code
     
-    # Get Shopify Settings for item group
-    try:
+    # Get item group from Shopify Settings
+    item_group = "Products"
+    if frappe.db.exists("Shopify Settings"):
         shopify_settings = frappe.get_single("Shopify Settings")
-        item_group = shopify_settings.price_list or "Products"
-    except:
-        item_group = "Products"
+        if hasattr(shopify_settings, "item_group") and shopify_settings.item_group:
+            item_group = shopify_settings.item_group
+    
+    # Get price
+    price = line_item.get("price", 0)
+    if price:
+        price = float(price)
     
     # Create new Item
     item_doc = frappe.get_doc({
@@ -75,10 +92,16 @@ def handle_misc_line_item(line_item, order):
         "item_group": item_group,
         "stock_uom": "Nos",
         "is_stock_item": 0,  # Non-inventory item
+        "is_sales_item": 1,
+        "standard_rate": price,
         "description": f"Shopify {'tip' if is_tip else 'custom item'} (no product_id): {item_name}",
-        "shopify_product_id": "",
-        "shopify_variant_id": "",
     })
+    
+    # Add Shopify fields if they exist as custom fields
+    if hasattr(item_doc, "shopify_product_id"):
+        item_doc.shopify_product_id = ""
+    if hasattr(item_doc, "shopify_variant_id"):
+        item_doc.shopify_variant_id = ""
     
     item_doc.insert(ignore_permissions=True)
     frappe.db.commit()
@@ -91,26 +114,22 @@ def handle_misc_line_item(line_item, order):
 
 def log_misc_item(line_item, order, item_code, is_tip):
     """Create audit log for miscellaneous items"""
-    try:
-        log_content = f"""
-            <b>Shopify {'Tip' if is_tip else 'Custom Item'} Created</b><br><br>
-            <b>Order:</b> {order.name}<br>
-            <b>Line Item:</b> {line_item.name}<br>
-            <b>Item Code:</b> {item_code}<br>
-            <b>Price:</b> {line_item.price}<br>
-            <b>Quantity:</b> {line_item.quantity}<br>
-            <b>SKU:</b> {getattr(line_item, 'sku', 'N/A')}<br>
-            <b>Reason:</b> product_id is null (expected for tips/custom items)
+    order_id = order.get("id", "Unknown")
+    order_name = order.get("name", "Unknown")
+    price = line_item.get("price", "0")
+    quantity = line_item.get("quantity", "0")
+    sku = line_item.get("sku", "N/A")
+    line_item_name = line_item.get("name") or line_item.get("title", "Unknown")
+    
+    frappe.log_error(
+        title=f"Shopify {'Tip' if is_tip else 'Custom Item'} Created",
+        message=f"""
+Order: {order_name} (ID: {order_id})
+Line Item: {line_item_name}
+Item Code Created: {item_code}
+Price: {price}
+Quantity: {quantity}
+SKU: {sku}
+Reason: product_id is null (expected for tips/custom items)
         """
-        
-        frappe.get_doc({
-            "doctype": "Comment",
-            "comment_type": "Info",
-            "reference_doctype": "Item",
-            "reference_name": item_code,
-            "content": log_content
-        }).insert(ignore_permissions=True)
-        
-    except Exception as e:
-        frappe.log_error(f"Failed to log misc item: {str(e)}", "Shopify Misc Item Log Error")
-
+    )

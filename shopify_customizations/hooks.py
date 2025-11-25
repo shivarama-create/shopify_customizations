@@ -1,7 +1,8 @@
 app_name = "shopify_customizations"
 app_title = "Shopify Customizations"
-app_publisher = "shiva"
-app_description = "product id fix"
+app_publisher = "Your Company"
+app_description = "Custom overrides for Shopify integration"
+app_version = "0.0.1
 app_email = "shivarama@cozycornerpatios.com"
 app_license = "mit"
 
@@ -247,5 +248,5 @@ app_license = "mit"
 
 # Load Shopify overrides on app startup
 after_migrate = "shopify_customizations.overrides"
-
+boot_session = "shopify_customizations.boot.boot_session"
 
